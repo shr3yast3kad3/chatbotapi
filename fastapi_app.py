@@ -20,7 +20,7 @@ from langchain.memory import CombinedMemory
 
 #with open('keys.json') as json_file:
 #    api_key = json.load(json_file)['api_key']
-os.environ["OPENAI_API_KEY"] = api_key
+#os.environ["OPENAI_API_KEY"] = api_key
 
 document = pd.read_csv('./data/train.csv')
 document.rename(columns = {'Lead_Creation_Date':'Date'}, inplace = True)
@@ -59,6 +59,10 @@ little_guy_with_memory = create_pandas_dataframe_agent(
     )
 
 app = FastAPI()
+
+@app.get('/')
+async def root(prompt: str):
+	return little_guy_with_memory.run("Hi!")
 
 @app.get('/little_guy/{prompt}')
 async def root(prompt: str):
