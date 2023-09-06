@@ -53,16 +53,6 @@ from langchain.memory import CombinedMemory
 #    api_key = json.load(json_file)['api_key']
 #os.environ["OPENAI_API_KEY"] = api_key
 
-with open(r'prompt.py', 'r') as file:
-    data = file.read()
-    data = data.replace(orig, replacement)
-
-with open(r'prompt.py', 'w') as file:
-    file.write(data)
-
-print("Text Replaced")
-
-
 document = pd.read_csv('./data/train.csv')
 document.rename(columns = {'Lead_Creation_Date':'Date'}, inplace = True)
 document['Date'] = pd.to_datetime(document['Date'], format="%d/%m/%y")
