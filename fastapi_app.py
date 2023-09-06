@@ -20,13 +20,11 @@ Entities that the conversation is about:
 
 print(os.listdir(r'/opt/render/project/src/.venv/lib/python3.10/site-packages/langchain/agents/agent_toolkits/pandas'))
 
-file_loc = r'/opt/render/project/src/.venv/lib/python3.10/site-packages/langchain/agents/agent_toolkits/pandas/prompt.py'
-
-with open(file_loc, 'r') as file:
+with open(r'/opt/render/project/src/.venv/lib/python3.10/site-packages/langchain/agents/agent_toolkits/pandas/prompt.py', 'r') as file:
     data = file.read()
     data = data.replace(orig, replacement)
   
-with open(file_loc, 'w') as file:
+with open(r'/opt/render/project/src/.venv/lib/python3.10/site-packages/langchain/agents/agent_toolkits/pandas/prompt.py', 'w') as file:
     file.write(data)
 
 #importing dependencies
