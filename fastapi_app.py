@@ -1,5 +1,6 @@
 #importing dependencies
 
+import json
 from fastapi import FastAPI
 import os
 import pandas as pd
@@ -17,8 +18,8 @@ from langchain.memory import ConversationSummaryMemory, ChatMessageHistory
 from langchain.memory import ConversationKGMemory
 from langchain.memory import CombinedMemory
 
-with open('keys.json') as json_file:
-    api_key = json.load(json_file)['api_key']
+#with open('keys.json') as json_file:
+#    api_key = json.load(json_file)['api_key']
 os.environ["OPENAI_API_KEY"] = api_key
 
 document = pd.read_csv('./data/train.csv')
