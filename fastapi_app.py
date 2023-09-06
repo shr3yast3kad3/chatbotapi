@@ -1,3 +1,30 @@
+orig = r'''PREFIX = """
+You are working with a pandas dataframe in Python. The name of the dataframe is `df`.
+You should use the tools below to answer the question posed of you:"""'''
+
+replacement = r'''PREFIX = """
+You are working with a pandas dataframe in Python. The name of the dataframe is `df`.
+You should use the tools below to answer the question posed of you:
+
+Summary of the whole conversation:
+{chat_history_summary}
+
+Last few messages between you and user:
+{chat_history_buffer}
+
+Entities that the conversation is about:
+{chat_history_KG}
+"""'''
+
+file_loc = r'/opt/render/project/src/.venv/lib/python3.10/site-packages/langchain/agents/agent_toolkits/pandas/prompt.py'
+
+with open(file_loc, 'r') as file:
+    data = file.read()
+    data = data.replace(orig, replacement)
+  
+with open(file_loc, 'w') as file:
+    file.write(data)
+
 #importing dependencies
 
 import json
@@ -21,6 +48,16 @@ from langchain.memory import CombinedMemory
 #with open('keys.json') as json_file:
 #    api_key = json.load(json_file)['api_key']
 #os.environ["OPENAI_API_KEY"] = api_key
+
+with open(r'prompt.py', 'r') as file:
+    data = file.read()
+    data = data.replace(orig, replacement)
+
+with open(r'prompt.py', 'w') as file:
+    file.write(data)
+
+print("Text Replaced")
+
 
 document = pd.read_csv('./data/train.csv')
 document.rename(columns = {'Lead_Creation_Date':'Date'}, inplace = True)
