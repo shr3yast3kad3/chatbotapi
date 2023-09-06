@@ -1,0 +1,950 @@
+import asyncio
+import inspect
+import os
+import platform as p
+import secrets
+import shutil
+import sys
+import tempfile
+from enum import Enum
+from functools import wraps
+from http import HTTPStatus
+from importlib import import_module
+from pathlib import Path
+from shutil import copytree
+from tempfile import mkdtemp
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+
+import requests
+import yaml
+from dotenv import dotenv_values
+from jina import Flow
+
+from .backend.utils import fix_sys_path
+from .config import DEFAULT_TIMEOUT, get_jcloud_config
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
+
+APP_NAME = 'langchain'
+BABYAGI_APP_NAME = 'babyagi'
+PDF_QNA_APP_NAME = 'pdfqna'
+PANDAS_AI_APP_NAME = 'pandasai'
+AUTOGPT_APP_NAME = 'autogpt'
+SLACKBOT_DEMO_APP_NAME = 'slackbot'
+SLACK_BOT_NAME = 'langchain-bot'
+
+JINA_VERSION = '3.18.0'
+DOCARRAY_VERSION = '0.21.0'
+
+ServingGatewayConfigFile = 'servinggateway_config.yml'
+APP_MONITOR_URL = "[https://cloud.jina.ai/](https://cloud.jina.ai/user/flows?action=detail&id={app_id}&tab=monitor)"
+PRICING_URL = "****{cph}**** ([Read about pricing here](https://github.com/jina-ai/langchain-serve#-pricing))"
+INIT_MODULE = '__init__'
+
+
+def syncify(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        return asyncio.run(f(*args, **kwargs))
+
+    return wrapper
+
+
+def hubble_exists(name: str, secret: Optional[str] = None) -> bool:
+    return (
+        requests.get(
+            url='https://api.hubble.jina.ai/v2/executor/getMeta',
+            params={'id': name, 'secret': secret},
+        ).status_code
+        == HTTPStatus.OK
+    )
+
+
+def _add_to_path(lcserve_app: bool = False):
+    # add current directory to the beginning of the path to prioritize local imports
+    sys.path.insert(0, os.getcwd())
+
+    if lcserve_app:
+        # get all directories in the apps folder and add them to the path
+        for app in os.listdir(os.path.join(os.path.dirname(__file__), 'apps')):
+            if os.path.isdir(os.path.join(os.path.dirname(__file__), 'apps', app)):
+                sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'apps', app))
+
+
+def _get_parent_dir(modname: str, filename: str) -> str:
+    parts = modname.split('.')
+    parent_dir = os.path.dirname(filename)
+    for _ in range(len(parts) - 1):
+        parent_dir = os.path.dirname(parent_dir)
+    return parent_dir
+
+
+def _load_module_from_str(module_str: str):
+    try:
+        module = import_module(module_str)
+    except ModuleNotFoundError:
+        print(f'Could not find module {module_str}')
+        sys.exit(1)
+    except AttributeError:
+        print(f'Could not find appdir for module {module_str}')
+        sys.exit(1)
+    except Exception as e:
+        print(f'Unknown error: {e}')
+        sys.exit(1)
+    return module
+
+
+def _load_app_from_fastapi_app_str(
+    fastapi_app_str: str,
+) -> Tuple['FastAPI', ModuleType]:
+    from .backend.playground.utils.helper import (
+        ImportFromStringError,
+        import_from_string,
+    )
+
+    try:
+        fastapi_app, module = import_from_string(fastapi_app_str)
+    except ImportFromStringError as e:
+        print(f'Could not import app from {fastapi_app_str}: {e}')
+        sys.exit(1)
+
+    return fastapi_app, module
+
+
+def _any_websocket_route_in_app(app: 'FastAPI') -> bool:
+    from fastapi.routing import APIWebSocketRoute
+
+    return any(isinstance(r, APIWebSocketRoute) for r in app.routes)
+
+
+def _any_websocket_router_in_module(module: ModuleType) -> bool:
+    # Go through the module and find all functions decorated by `serving` decorator
+    for _, func in inspect.getmembers(module, inspect.isfunction):
+        if hasattr(func, '__ws_serving__'):
+            return True
+
+    return False
+
+
+def get_module_dir(
+    module_str: str = None,
+    fastapi_app_str: str = None,
+    app_dir: str = None,
+    lcserve_app: bool = False,
+) -> Tuple[str, bool]:
+    fix_sys_path(lcserve_app=lcserve_app)
+
+    if module_str is not None:
+        # if module_str is ., then it is the current directory. So, we can use __init__ as the module
+        if module_str == '.':
+            module_str = INIT_MODULE
+        # if module_str is a directory, then importing `module_str` will import the __init__.py file in that directory
+
+        _module = _load_module_from_str(module_str)
+        _is_websocket = _any_websocket_router_in_module(_module)
+        _module_dir = _get_parent_dir(modname=module_str, filename=_module.__file__)
+    elif fastapi_app_str is not None:
+        fastapi_app, _module = _load_app_from_fastapi_app_str(fastapi_app_str)
+        _is_websocket = _any_websocket_route_in_app(fastapi_app)
+        _module_dir = _get_parent_dir(
+            modname=fastapi_app_str, filename=_module.__file__
+        )
+
+    # if app_dir is not None, return it
+    if app_dir is not None:
+        return app_dir, _is_websocket
+
+    if not _module.__file__.endswith('.py'):
+        print(f'Unknown file type for module {module_str}')
+        sys.exit(1)
+
+    return _module_dir, _is_websocket
+
+
+def _remove_langchain_serve(tmpdir: str) -> None:
+    _requirements_txt = 'requirements.txt'
+    _pyproject_toml = 'pyproject.toml'
+
+    # Remove langchain-serve itself from the requirements list as a fixed version might break things
+    if os.path.exists(os.path.join(tmpdir, _requirements_txt)):
+        with open(os.path.join(tmpdir, _requirements_txt), 'r') as f:
+            reqs = f.read().splitlines()
+
+        reqs = [r for r in reqs if not r.startswith("langchain-serve")]
+        with open(os.path.join(tmpdir, _requirements_txt), 'w') as f:
+            f.write('\n'.join(reqs))
+
+    if os.path.exists(os.path.join(tmpdir, _pyproject_toml)):
+        import toml
+
+        with open(os.path.join(tmpdir, _pyproject_toml), 'r') as f:
+            pyproject = toml.load(f)
+
+        if 'tool' in pyproject and 'poetry' in pyproject['tool']:
+            poetry = pyproject['tool']['poetry']
+            if 'dependencies' in poetry:
+                poetry['dependencies'] = {
+                    k: v
+                    for k, v in poetry['dependencies'].items()
+                    if k != 'langchain-serve'
+                }
+
+            if 'dev-dependencies' in poetry:
+                poetry['dev-dependencies'] = {
+                    k: v
+                    for k, v in poetry['dev-dependencies'].items()
+                    if k != 'langchain-serve'
+                }
+
+        with open(os.path.join(tmpdir, _pyproject_toml), 'w') as f:
+            toml.dump(pyproject, f)
+
+
+def _handle_dependencies(reqs: Tuple[str], tmpdir: str):
+    # Create the requirements.txt if requirements are given
+    _requirements_txt = 'requirements.txt'
+    _pyproject_toml = 'pyproject.toml'
+
+    _existing_requirements = []
+    # Get existing requirements and add the new ones
+    if os.path.exists(os.path.join(tmpdir, _requirements_txt)):
+        with open(os.path.join(tmpdir, _requirements_txt), 'r') as f:
+            _existing_requirements = tuple(f.read().splitlines())
+
+    _new_requirements = []
+    if reqs is not None:
+        for _req in reqs:
+            if os.path.isdir(_req):
+                if os.path.exists(os.path.join(_req, _requirements_txt)):
+                    with open(os.path.join(_req, _requirements_txt), 'r') as f:
+                        _new_requirements = f.read().splitlines()
+
+                elif os.path.exists(os.path.join(_req, _pyproject_toml)):
+                    # copy pyproject.toml to tmpdir
+                    shutil.copyfile(
+                        os.path.join(_req, _pyproject_toml),
+                        os.path.join(tmpdir, _pyproject_toml),
+                    )
+            elif os.path.isfile(_req):
+                # if it's a file and name is requirements.txt, read it
+                if os.path.basename(_req) == _requirements_txt:
+                    with open(_req, 'r') as f:
+                        _new_requirements = f.read().splitlines()
+                elif os.path.basename(_req) == _pyproject_toml:
+                    # copy pyproject.toml to tmpdir
+                    shutil.copyfile(_req, os.path.join(tmpdir, _pyproject_toml))
+            else:
+                _new_requirements.append(_req)
+
+        _final_requirements = set(_existing_requirements).union(set(_new_requirements))
+        with open(os.path.join(tmpdir, _requirements_txt), 'w') as f:
+            f.write('\n'.join(_final_requirements))
+
+    _remove_langchain_serve(tmpdir)
+
+
+def _handle_dockerfile(tmpdir: str, version: str):
+    # if file `lcserve.Dockefile` exists, use it
+    _lcserve_dockerfile = 'lcserve.Dockerfile'
+    if os.path.exists(os.path.join(tmpdir, _lcserve_dockerfile)):
+        shutil.copyfile(
+            os.path.join(tmpdir, _lcserve_dockerfile),
+            os.path.join(tmpdir, 'Dockerfile'),
+        )
+
+        # read the Dockerfile and replace the version
+        with open(os.path.join(tmpdir, 'Dockerfile'), 'r') as f:
+            dockerfile = f.read()
+
+        dockerfile = dockerfile.replace(
+            'jinawolf/serving-gateway:${version}',
+            f'jinawolf/serving-gateway:{version}',
+        )
+
+        if 'ENTRYPOINT' not in dockerfile:
+            dockerfile = (
+                dockerfile
+                + '\nENTRYPOINT [ "jina", "gateway", "--uses", "config.yml" ]'
+            )
+
+        with open(os.path.join(tmpdir, 'Dockerfile'), 'w') as f:
+            f.write(dockerfile)
+
+    else:
+        # Create the Dockerfile
+        with open(os.path.join(tmpdir, 'Dockerfile'), 'w') as f:
+            dockerfile = [
+                f'FROM jinawolf/serving-gateway:{version}',
+                'COPY . /appdir/',
+                'RUN if [ -e /appdir/requirements.txt ]; then pip install -r /appdir/requirements.txt; fi',
+                'ENTRYPOINT [ "jina", "gateway", "--uses", "config.yml" ]',
+            ]
+            f.write('\n\n'.join(dockerfile))
+
+
+def _handle_config_yaml(tmpdir: str, name: str):
+    # Create the config.yml
+    with open(os.path.join(tmpdir, 'config.yml'), 'w') as f:
+        config_dict = {
+            'jtype': 'ServingGateway',
+            'py_modules': ['lcserve/backend/__init__.py'],
+            'metas': {
+                'name': name,
+            },
+        }
+        f.write(yaml.safe_dump(config_dict, sort_keys=False))
+
+
+def _push_to_hubble(
+    tmpdir: str, name: str, tag: str, platform: str, verbose: bool, public: bool
+) -> str:
+    from hubble.executor.hubio import HubIO
+    from hubble.executor.parsers import set_hub_push_parser
+
+    from .backend.playground.utils.helper import EnvironmentVarCtxtManager
+
+    secret = secrets.token_hex(8)
+    args_list = [
+        tmpdir,
+        '--tag',
+        tag,
+        '--no-usage',
+        '--no-cache',
+    ]
+    if verbose:
+        args_list.remove('--no-usage')
+        args_list.append('--verbose')
+    if not public:
+        args_list.append('--secret')
+        args_list.append(secret)
+        args_list.append('--private')
+
+    args = set_hub_push_parser().parse_args(args_list)
+
+    if platform:
+        args.platform = platform
+
+    if hubble_exists(name, secret):
+        args.force_update = name
+
+    push_envs = (
+        {'JINA_HUBBLE_HIDE_EXECUTOR_PUSH_SUCCESS_MSG': 'true'} if not verbose else {}
+    )
+    with EnvironmentVarCtxtManager(push_envs):
+        response = HubIO(args).push()
+        image_name = response['name']
+        user_name = response['owner']['name']
+        return f'{user_name}/{image_name}:{tag}'
+
+
+def push_app_to_hubble(
+    module_dir: str,
+    image_name=None,
+    tag: str = 'latest',
+    requirements: Tuple[str] = None,
+    version: str = 'latest',
+    platform: str = None,
+    verbose: Optional[bool] = False,
+    public: Optional[bool] = False,
+) -> str:
+    from .backend.playground.utils.helper import get_random_name
+
+    tmpdir = mkdtemp()
+
+    # Auto convert platform to amd64 if this is Mac
+    if p.machine() == 'arm64':
+        platform = "linux/amd64"
+
+    # Copy appdir to tmpdir
+    copytree(module_dir, tmpdir, dirs_exist_ok=True)
+    # Copy lcserve to tmpdir
+    copytree(
+        os.path.dirname(__file__), os.path.join(tmpdir, 'lcserve'), dirs_exist_ok=True
+    )
+
+    if image_name is None:
+        image_name = get_random_name()
+    _handle_dependencies(requirements, tmpdir)
+    _handle_dockerfile(tmpdir, version)
+    _handle_config_yaml(tmpdir, image_name)
+    return _push_to_hubble(tmpdir, image_name, tag, platform, verbose, public)
+
+
+def get_gateway_config_yaml_path() -> str:
+    return os.path.join(os.path.dirname(__file__), ServingGatewayConfigFile)
+
+
+def get_gateway_uses(id: str) -> str:
+    if id is not None:
+        if id.startswith('jinahub+docker') or id.startswith('jinaai+docker'):
+            return id
+    return f'jinaai+docker://{id}'
+
+
+def get_existing_name(app_id: str) -> str:
+    from jcloud.flow import CloudFlow
+
+    from .backend.playground.utils.helper import asyncio_run_property
+
+    flow_obj = asyncio_run_property(CloudFlow(flow_id=app_id).status)
+    if (
+        'spec' in flow_obj
+        and 'jcloud' in flow_obj['spec']
+        and 'name' in flow_obj['spec']['jcloud']
+    ):
+        return flow_obj['spec']['jcloud']['name']
+
+
+def get_global_jcloud_args(app_id: str = None, name: str = APP_NAME) -> Dict:
+    if app_id is not None:
+        _name = get_existing_name(app_id)
+        if _name is not None:
+            name = _name
+
+    return {
+        'jcloud': {
+            'name': name,
+            'labels': {
+                'app': APP_NAME,
+            },
+            'version': JINA_VERSION,
+            'docarray': DOCARRAY_VERSION,
+            'monitor': {
+                'traces': {
+                    'enable': True,
+                },
+                'metrics': {
+                    'enable': True,
+                    'host': 'http://opentelemetry-collector.monitor.svc.cluster.local',
+                    'port': 4317,
+                },
+            },
+        }
+    }
+
+
+def get_uvicorn_args() -> Dict:
+    return {
+        'uvicorn_kwargs': {
+            'ws_ping_interval': None,
+            'ws_ping_timeout': None,
+        }
+    }
+
+
+def get_with_args_for_jcloud(cors: bool = True, envs: Dict = {}) -> Dict:
+    return {
+        'with': {
+            'cors': cors,
+            'extra_search_paths': ['/workdir/lcserve'],
+            'env': envs or {},
+            **get_uvicorn_args(),
+        }
+    }
+
+
+def get_flow_dict(
+    module_str: str = None,
+    fastapi_app_str: str = None,
+    jcloud: bool = False,
+    port: int = 8080,
+    name: str = APP_NAME,
+    timeout: int = DEFAULT_TIMEOUT,
+    app_id: str = None,
+    gateway_id: str = None,
+    is_websocket: bool = False,
+    jcloud_config_path: str = None,
+    cors: bool = True,
+    env: str = None,
+    lcserve_app: bool = False,
+) -> Dict:
+    # if module_str is ., then it is the current directory. So, we can use __init__ as the module
+    if module_str == '.':
+        module_str = INIT_MODULE
+    # if module_str is a directory, we need to change the module_str to __init__, as during upload we only upload the directory. Only for jcloud
+    elif module_str and os.path.isdir(module_str) and jcloud:
+        module_str = INIT_MODULE
+
+    if jcloud:
+        jcloud_config = get_jcloud_config(
+            config_path=jcloud_config_path, timeout=timeout, is_websocket=is_websocket
+        )
+
+    _envs = {}
+    if env is not None:
+        # read env file and load to _envs dict
+        from dotenv import dotenv_values
+
+        _envs = dict(dotenv_values(env))
+
+    uses = get_gateway_uses(id=gateway_id) if jcloud else get_gateway_config_yaml_path()
+
+    if jcloud:
+        _envs['LCSERVE_IMAGE'] = uses
+        _envs['LCSERVE_APP_NAME'] = name
+
+    flow_dict = {
+        'jtype': 'Flow',
+        **(get_with_args_for_jcloud(cors, _envs) if jcloud else {}),
+        'gateway': {
+            'uses': uses,
+            'uses_with': {
+                'modules': [module_str] if module_str else [],
+                'fastapi_app_str': fastapi_app_str or '',
+                'lcserve_app': lcserve_app,
+            },
+            'port': [port],
+            'protocol': ['websocket'] if is_websocket else ['http'],
+            'env': _envs if _envs else {},
+            **get_uvicorn_args(),
+            **(jcloud_config.to_dict() if jcloud else {}),
+        },
+        **(get_global_jcloud_args(app_id=app_id, name=name) if jcloud else {}),
+    }
+    if os.environ.get("LCSERVE_TEST", False):
+        if 'with' not in flow_dict:
+            flow_dict['with'] = {}
+
+        flow_dict['with'].update(
+            {
+                'metrics': True,
+                'metrics_exporter_host': 'http://localhost',
+                'metrics_exporter_port': 4317,
+                'tracing': True,
+                'traces_exporter_host': 'http://localhost',
+                'traces_exporter_port': 4317,
+            }
+        )
+    return flow_dict
+
+
+def get_flow_yaml(
+    module_str: str = None,
+    fastapi_app_str: str = None,
+    jcloud: bool = False,
+    port: int = 8080,
+    name: str = APP_NAME,
+    is_websocket: bool = False,
+    cors: bool = True,
+    jcloud_config_path: str = None,
+    env: str = None,
+    lcserve_app: bool = False,
+) -> str:
+    return yaml.safe_dump(
+        get_flow_dict(
+            module_str=module_str,
+            fastapi_app_str=fastapi_app_str,
+            port=port,
+            name=name,
+            is_websocket=is_websocket,
+            cors=cors,
+            jcloud=jcloud,
+            jcloud_config_path=jcloud_config_path,
+            env=env,
+            lcserve_app=lcserve_app,
+        ),
+        sort_keys=False,
+    )
+
+
+class ExportKind(str, Enum):
+    KUBERNETES = 'kubernetes'
+    DOCKER_COMPOSE = 'docker-compose'
+
+
+def export_app(
+    module_str: str,
+    fastapi_app_str: str,
+    app_dir: str,
+    path: str,
+    kind: ExportKind,
+    image_name=None,
+    tag: str = 'latest',
+    requirements: Tuple[str] = None,
+    version: str = 'latest',
+    platform: str = None,
+    verbose: Optional[bool] = False,
+    public: Optional[bool] = False,
+    name: str = APP_NAME,
+    timeout: int = DEFAULT_TIMEOUT,
+    env: str = None,
+):
+    module_dir, is_websocket = get_module_dir(
+        module_str=module_str,
+        fastapi_app_str=fastapi_app_str,
+        app_dir=app_dir,
+    )
+
+    gateway_id = push_app_to_hubble(
+        module_dir=module_dir,
+        image_name=image_name,
+        tag=tag,
+        requirements=requirements,
+        version=version,
+        platform=platform,
+        verbose=verbose,
+        public=public,
+    )
+
+    flow_dict = get_flow_dict(
+        module_str=module_str,
+        fastapi_app_str=fastapi_app_str,
+        jcloud=True,
+        port=8080,
+        name=name,
+        timeout=timeout,
+        app_id=None,
+        gateway_id=gateway_id,
+        is_websocket=is_websocket,
+        jcloud_config_path=None,
+        cors=True,
+        env=env,
+        lcserve_app=False,
+    )
+
+    f: Flow = Flow.load_config(flow_dict)
+
+    if kind == ExportKind.KUBERNETES:
+        f.to_kubernetes_yaml(path)
+    elif kind == ExportKind.DOCKER_COMPOSE:
+        _path = Path(path)
+        if _path.is_file() and _path.suffix in ['.yml', '.yaml']:
+            f.to_docker_compose_yaml(path)
+        elif _path.is_dir():
+            f.to_docker_compose_yaml(os.path.join(path, 'docker-compose.yml'))
+        else:
+            raise ValueError('path must be a file or a directory')
+
+
+async def deploy_app_on_jcloud(
+    flow_dict: Dict, app_id: str = None, verbose: bool = False
+) -> Tuple[str, str]:
+    from .backend.playground.utils.helper import EnvironmentVarCtxtManager
+
+    os.environ['JCLOUD_LOGLEVEL'] = 'INFO' if verbose else 'ERROR'
+
+    from jcloud.flow import CloudFlow
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        flow_path = os.path.join(tmpdir, 'flow.yml')
+        with open(flow_path, 'w') as f:
+            yaml.safe_dump(flow_dict, f, sort_keys=False)
+
+        deploy_envs = {'JCLOUD_HIDE_SUCCESS_MSG': 'true'} if not verbose else {}
+        with EnvironmentVarCtxtManager(deploy_envs):
+            if app_id is None:  # appid is None means we are deploying a new app
+                jcloud_flow = await CloudFlow(path=flow_path).__aenter__()
+                app_id = jcloud_flow.flow_id
+
+            else:  # appid is not None means we are updating an existing app
+                jcloud_flow = CloudFlow(path=flow_path, flow_id=app_id)
+                await jcloud_flow.update()
+
+        for k, v in jcloud_flow.endpoints.items():
+            if k.lower() == 'gateway (http)' or k.lower() == 'gateway (websocket)':
+                return app_id, v
+
+    return None, None
+
+
+async def patch_secret_on_jcloud(
+    flow_dict: Dict, app_id: str, secret: str, verbose: bool = False
+):
+    from .backend.playground.utils.helper import EnvironmentVarCtxtManager
+    from .backend.utils import get_random_name
+
+    os.environ['JCLOUD_LOGLEVEL'] = 'INFO' if verbose else 'ERROR'
+
+    from jcloud.flow import CloudFlow
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        flow_path = os.path.join(tmpdir, 'flow.yml')
+        with open(flow_path, 'w') as f:
+            yaml.safe_dump(flow_dict, f, sort_keys=False)
+
+        deploy_envs = {'JCLOUD_HIDE_SUCCESS_MSG': 'true'} if not verbose else {}
+        with EnvironmentVarCtxtManager(deploy_envs):
+            jcloud_flow = CloudFlow(path=flow_path, flow_id=app_id)
+            secret_name = get_random_name()
+
+            secrets_values = dict(dotenv_values(secret))
+            await jcloud_flow.create_secret(
+                secret_name=secret_name, env_secret_data=secrets_values, update=True
+            )
+
+
+async def get_app_status_on_jcloud(app_id: str):
+    from jcloud.flow import CloudFlow
+    from rich import box
+    from rich.align import Align
+    from rich.console import Console
+    from rich.markdown import Markdown
+    from rich.table import Table
+
+    _t = Table(
+        'Attribute',
+        'Value',
+        show_header=False,
+        box=box.ROUNDED,
+        highlight=True,
+        show_lines=True,
+    )
+
+    def _add_row(
+        key,
+        value,
+        bold_key: bool = False,
+        bold_value: bool = False,
+        center_align: bool = True,
+    ):
+        return _t.add_row(
+            Align(f'[bold]{key}' if bold_key else key, vertical='middle'),
+            Align(f'[bold]{value}[/bold]' if bold_value else value, align='center')
+            if center_align
+            else value,
+        )
+
+    console = Console()
+    with console.status(f'[bold]Getting app status for [green]{app_id}[/green]'):
+        app_details = await CloudFlow(flow_id=app_id).status
+        if app_details is None:
+            return
+
+        if 'status' not in app_details:
+            return
+
+        def _get_endpoint(app):
+            endpoints = app.get('endpoints', {})
+            return list(endpoints.values())[0] if endpoints else ''
+
+        def _replace_wss_with_https(endpoint: str):
+            return endpoint.replace('wss://', 'https://')
+
+        status: Dict = app_details['status']
+        total_cph = app_details.get('CPH', {}).get('total', 0)
+        endpoint = _get_endpoint(status)
+
+        _add_row('App ID', app_id, bold_key=True, bold_value=True)
+        _add_row('Phase', status.get('phase', ''))
+        _add_row('Endpoint', endpoint)
+        _add_row(
+            'App Monitoring',
+            Markdown(APP_MONITOR_URL.format(app_id=app_id), justify='center'),
+        )
+        _add_row(
+            'Base credits (per hour)',
+            Markdown(PRICING_URL.format(cph=total_cph), justify='center'),
+        )
+        _add_row('Swagger UI', _replace_wss_with_https(f'{endpoint}/docs'))
+        _add_row('OpenAPI JSON', _replace_wss_with_https(f'{endpoint}/openapi.json'))
+        _add_row(
+            'Slack Events URL', _replace_wss_with_https(f'{endpoint}/slack/events')
+        )
+        console.print(_t)
+
+
+async def list_apps_on_jcloud(phase: str, name: str):
+    from jcloud.flow import CloudFlow
+    from jcloud.helper import cleanup_dt, get_phase_from_response
+    from rich import box, print
+    from rich.console import Console
+    from rich.table import Table
+
+    _t = Table(
+        'AppID',
+        'Phase',
+        'Endpoint',
+        'Created',
+        box=box.ROUNDED,
+        highlight=True,
+    )
+
+    console = Console()
+    with console.status(f'[bold]Listing all apps'):
+        all_apps = await CloudFlow().list_all(
+            phase=phase, name=name, labels=f'app={APP_NAME}'
+        )
+        if not all_apps:
+            print('No apps found')
+            return
+
+        def _get_endpoint(app):
+            endpoints = app.get('status', {}).get('endpoints', {})
+            return list(endpoints.values())[0] if endpoints else ''
+
+        for app in all_apps['flows']:
+            _t.add_row(
+                app['id'],
+                get_phase_from_response(app),
+                _get_endpoint(app),
+                cleanup_dt(app['ctime']),
+            )
+        console.print(_t)
+
+
+async def pause_app_on_jcloud(app_id: str) -> None:
+    from jcloud.flow import CloudFlow
+    from rich import print
+
+    from .backend.playground.utils.helper import EnvironmentVarCtxtManager
+
+    with EnvironmentVarCtxtManager({'JCLOUD_HIDE_SUCCESS_MSG': 'true'}):
+        await CloudFlow(flow_id=app_id).pause()
+    print(f'App [bold][green]{app_id}[/green][/bold] paused successfully!')
+
+
+async def resume_app_on_jcloud(app_id: str) -> None:
+    from jcloud.flow import CloudFlow
+    from rich import print
+
+    from .backend.playground.utils.helper import EnvironmentVarCtxtManager
+
+    with EnvironmentVarCtxtManager({'JCLOUD_HIDE_SUCCESS_MSG': 'true'}):
+        await CloudFlow(flow_id=app_id).resume()
+    print(f'App [bold][green]{app_id}[/green][/bold] resumed successfully!')
+
+
+async def remove_app_on_jcloud(app_id: str) -> None:
+    from jcloud.flow import CloudFlow
+    from rich import print
+
+    await CloudFlow(flow_id=app_id).__aexit__()
+    print(f'App [bold][green]{app_id}[/green][/bold] removed successfully!')
+
+
+async def list_jobs_on_jcloud(flow_id: str):
+    import json
+
+    from jcloud.flow import CloudFlow
+    from jcloud.helper import cleanup_dt
+    from rich import box
+    from rich.console import Console
+    from rich.table import Table
+
+    _t = Table(
+        'Job Name',
+        'Status',
+        'Start Time',
+        'Completion Time',
+        'Last Probe Time',
+        box=box.ROUNDED,
+        highlight=True,
+    )
+
+    console = Console()
+    with console.status(f'[bold]Listing all jobs for app {flow_id}'):
+        all_jobs = await CloudFlow(flow_id=flow_id).list_resources('job')
+
+        for job in all_jobs:
+            _t.add_row(
+                job['name'],
+                job['status']['conditions'][-1]['type']
+                if job['status'].get('conditions')
+                else 'Failed',
+                cleanup_dt(job['status']['startTime']),
+                cleanup_dt(job['status'].get('completionTime', 'N/A')),
+                cleanup_dt(
+                    job['status']['conditions'][-1]['lastProbeTime']
+                    if job['status'].get('conditions')
+                    else 'N/A'
+                ),
+            )
+    console.print(_t)
+
+
+async def get_job_on_jcloud(job_name: str, flow_id: str):
+    import json
+
+    from jcloud.flow import CloudFlow
+    from rich import box
+    from rich.console import Console
+    from rich.json import JSON
+    from rich.table import Table
+
+    _t = Table(
+        'Job Name',
+        'Details',
+        box=box.ROUNDED,
+        highlight=True,
+    )
+
+    def jsonify(data: Union[Dict, List]) -> str:
+        return (
+            json.dumps(data, indent=2, sort_keys=True)
+            if isinstance(data, (dict, list))
+            else data
+        )
+
+    console = Console()
+    with console.status(f'[bold]Listing job details for job {job_name}'):
+        job = await CloudFlow(flow_id=flow_id).get_resource('job', job_name)
+
+        _t.add_row(
+            job['name'],
+            JSON(jsonify(job['status'])),
+        )
+    console.print(_t)
+
+
+class ImportFromStringError(Exception):
+    pass
+
+
+def load_local_df(module: str):
+    from importlib import import_module
+
+    _add_to_path()
+
+    module_str, _, attrs_str = module.partition(":")
+    if not module_str or not attrs_str:
+        message = (
+            'Import string "{import_str}" must be in format "<module>:<attribute>".'
+        )
+        raise ImportFromStringError(message.format(import_str=module))
+
+    try:
+        module = import_module(module_str)
+    except ImportError as exc:
+        if exc.name != module_str:
+            raise exc from None
+        message = 'Could not import module "{module_str}".'
+        raise ImportFromStringError(message.format(module_str=module_str))
+
+    instance = module
+    try:
+        for attr_str in attrs_str.split("."):
+            instance = getattr(instance, attr_str)
+    except AttributeError:
+        message = 'Could not import attribute "{attr_str}" from module "{module_str}".'
+        raise ImportFromStringError(
+            message.format(attr_str=attr_str, module_str=module_str)
+        )
+
+    return instance
+
+
+def update_requirements(path: str, requirements: List[str]) -> List[str]:
+    if os.path.exists(path):
+        with open(path) as f:
+            requirements.extend(f.read().splitlines())
+
+    return requirements
+
+
+def remove_prefix(text, prefix):
+    return text[len(prefix) :] if text.startswith(prefix) else text
+
+
+def create_slack_app_manifest(name) -> str:
+    slackbot_template = os.path.join(
+        os.path.dirname(__file__), 'backend', 'slackbot', 'template.yml'
+    )
+    with open(slackbot_template, 'r') as f:
+        slackbot_template = f.read()
+
+    slackbot_dict = yaml.safe_load(slackbot_template)
+    slackbot_dict['display_information']['name'] = name
+    slackbot_dict['features']['bot_user']['display_name'] = name
+    return yaml.dump(slackbot_dict)
