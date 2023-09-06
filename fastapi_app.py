@@ -20,10 +20,13 @@ Entities that the conversation is about:
 
 print(os.listdir(r'/opt/render/project/src/.venv/lib/python3.10/site-packages/langchain/agents/agent_toolkits/pandas'))
 
+print("First Open")
+
 with open(r'/opt/render/project/src/.venv/lib/python3.10/site-packages/langchain/agents/agent_toolkits/pandas/prompt.py', 'r') as file:
     data = file.read()
     data = data.replace(orig, replacement)
-  
+
+print("Second Open")
 with open(r'/opt/render/project/src/.venv/lib/python3.10/site-packages/langchain/agents/agent_toolkits/pandas/prompt.py', 'w') as file:
     file.write(data)
 
@@ -65,6 +68,8 @@ document.rename(columns = {'Lead_Creation_Date':'Date'}, inplace = True)
 document['Date'] = pd.to_datetime(document['Date'], format="%d/%m/%y")
 document['DOB'] = pd.to_datetime(document['DOB'], format="%d/%m/%y")
 
+print("Read csv")
+
 llm_code = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo-16k") #gpt-3.5-turbo-16k-0613
 llm_context = ChatOpenAI(temperature=0.0, model_name="gpt-3.5-turbo-16k") #gpt-3.5-turbo
 
@@ -88,6 +93,8 @@ chat_history_KG = ConversationKGMemory(
 
 memory = CombinedMemory(memories=[chat_history_buffer, chat_history_summary, chat_history_KG])
 
+print("Memory defined")
+
 little_guy_with_memory = create_pandas_dataframe_agent(
     llm = llm_code, 
     df = document, 
@@ -99,6 +106,10 @@ little_guy_with_memory = create_pandas_dataframe_agent(
 app = FastAPI()
 
 @app.get('/')
+async def root(prompt: str):
+	return {"hello":"world"}
+
+@app.get('/hi')
 async def root(prompt: str):
 	return little_guy_with_memory.run("Hi!")
 
