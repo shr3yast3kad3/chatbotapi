@@ -16,7 +16,9 @@ from langchain.memory.buffer_window import ConversationBufferWindowMemory
 from langchain.memory import ConversationSummaryMemory, ChatMessageHistory
 from langchain.memory import ConversationKGMemory
 from langchain.memory import CombinedMemory
-api_key = "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"
+
+with open('keys.json') as json_file:
+    api_key = json.load(json_file)['api_key']
 os.environ["OPENAI_API_KEY"] = api_key
 
 document = pd.read_csv('./data/train.csv')
