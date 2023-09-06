@@ -16,6 +16,8 @@ Entities that the conversation is about:
 {chat_history_KG}
 """'''
 
+print(os.listdir(r'/opt/render/project/src/.venv/lib/python3.10/site-packages/langchain/agents/agent_toolkits/pandas'))
+
 file_loc = r'/opt/render/project/src/.venv/lib/python3.10/site-packages/langchain/agents/agent_toolkits/pandas/prompt.py'
 
 with open(file_loc, 'r') as file:
