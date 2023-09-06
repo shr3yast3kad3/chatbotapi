@@ -1,3 +1,5 @@
+import os
+
 orig = r'''PREFIX = """
 You are working with a pandas dataframe in Python. The name of the dataframe is `df`.
 You should use the tools below to answer the question posed of you:"""'''
@@ -31,7 +33,6 @@ with open(file_loc, 'w') as file:
 
 import json
 from fastapi import FastAPI
-import os
 import pandas as pd
 from langchain.agents import load_tools
 from langchain.agents import initialize_agent
